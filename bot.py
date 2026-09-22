@@ -1,11 +1,11 @@
 """
-Telegram-бот: анализирует трендовые темы на YouTube в сегменте стриминга
+Telegram-бот: анализирует трендовые темы на YouTube (русский сегмент стриминга)
 и подсказывает идеи для видео.
 
 Команды:
   /start   — приветствие и список команд
-  /trends  — текущие трендовые видео (кэшируются на 30 минут, чтобы не жечь квоту API)
-  /idea    — сгенерировать идеи для видео на основе последних трендов
+  /trends  — большая таблица трендов (100+ позиций), присылается файлом (HTML, с анимацией)
+  /idea    — короткие идеи в чат + HTML-отчёт с анализом подачи (форматы, вовлечённость, паттерны)
 
 Запуск:
   1. pip install -r requirements.txt
@@ -13,6 +13,7 @@ Telegram-бот: анализирует трендовые темы на YouTube
   3. python bot.py
 """
 
+import io
 import logging
 import re
 import sys
@@ -20,7 +21,7 @@ import time
 import os
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -28,7 +29,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from googleapiclient.errors import HttpError
 
 from youtube_trends import fetch_trends, format_trends_message, DEFAULT_KEYWORDS
-from idea_generator import generate_ideas
+from idea_generator import generate_ideas, build_style_report_html
+from report_builder import build_trends_html
 
 load_dotenv()
 
@@ -70,16 +72,27 @@ def _get_trends(force: bool = False):
     return _cache["videos"]
 
 
+async def _send_html_report(message, html_content: str, filename: str, caption: str = None):
+    buf = io.BytesIO(html_content.encode("utf-8"))
+    buf.name = filename
+    await message.reply_document(
+        document=InputFile(buf, filename=filename),
+        caption=caption,
+        parse_mode=ParseMode.HTML if caption else None,
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я слежу за трендами в сегменте стриминга на YouTube.\n\n"
-        "/trends — что сейчас хайповое и что набирает обороты\n"
-        "/idea — готовые углы для видео на основе трендов"
+        "Привет! Слежу за трендами русского сегмента YouTube в стриминге.\n\n"
+        "/trends — большая таблица (100+ видео) файлом: что уже хайповое, что растёт,\n"
+        "          и отдельно — маленькие каналы с большими просмотрами\n"
+        "/idea — идеи для видео + разбор подачи (форматы, вовлечённость, паттерны заголовков)"
     )
 
 
 async def trends_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.chat.send_action("typing")
+    await update.message.chat.send_action("upload_document")
     try:
         videos = _get_trends()
     except Exception as e:
@@ -87,8 +100,13 @@ async def trends_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Не получилось получить тренды.\n{_friendly_youtube_error(e)}")
         return
 
-    message = format_trends_message(videos)
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    if not videos:
+        await update.message.reply_text(format_trends_message(videos))
+        return
+
+    caption = format_trends_message(videos)
+    html_report = build_trends_html(videos)
+    await _send_html_report(update.message, html_report, "trends.html", caption=caption)
 
 
 async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,18 +121,28 @@ async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = generate_ideas(videos)
     await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
+    if videos:
+        await update.message.chat.send_action("upload_document")
+        style_report = build_style_report_html(videos)
+        await _send_html_report(update.message, style_report, "style_analysis.html")
+
 
 async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE):
     if not DIGEST_CHAT_ID:
         return
     try:
         videos = _get_trends(force=True)
-        message = format_trends_message(videos)
-        await context.bot.send_message(
+        caption = "☀️ Утренняя сводка трендов\n\n" + format_trends_message(videos)
+        if not videos:
+            await context.bot.send_message(chat_id=DIGEST_CHAT_ID, text=caption)
+            return
+        html_report = build_trends_html(videos)
+        buf = io.BytesIO(html_report.encode("utf-8"))
+        buf.name = "trends.html"
+        await context.bot.send_document(
             chat_id=DIGEST_CHAT_ID,
-            text="☀️ Утренняя сводка трендов\n\n" + message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            document=InputFile(buf, filename="trends.html"),
+            caption=caption,
         )
     except Exception:
         logger.exception("Failed to send daily digest")
