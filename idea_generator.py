@@ -1,21 +1,19 @@
 """
 Превращает список трендовых видео в:
 1. Короткий текстовый список идей (для сообщения в Telegram)
-2. HTML-отчёт с анализом паттернов подачи: сколько Shorts vs длинных роликов,
-   средняя вовлечённость по группам, частые приёмы в заголовках,
-   отдельный блок про маленькие каналы с большими просмотрами.
+2. HTML-отчёт с анализом паттернов подачи: форматы, вовлечённость, частые приёмы
+   в заголовках, отдельный блок про маленькие каналы с большими просмотрами,
+   плюс мнение ИИ-аналитика (если подключён Anthropic API — см. analyst.py).
 
 Это анализ метаданных (то, что реально отдаёт YouTube API), а не разбор монтажа
 по кадрам или содержания ролика — такого YouTube API не даёт.
 """
 
 import datetime
-import html
 import random
 from collections import Counter
 
-from youtube_trends import TrendVideo
-from report_builder import _row_html, _CSS, _esc
+from report_builder import _esc, _table_section, _CSS
 
 HOT_TEMPLATES = [
     "Разбери, почему «{title}» ({channel}) набрало {views:,} просмотров всего за {hours:.0f}ч — что именно сработало",
@@ -79,7 +77,8 @@ def _title_word_frequency(videos: list, top_n: int = 12) -> list:
     return counter.most_common(top_n)
 
 
-def build_style_report_html(videos: list, title: str = "Анализ подачи — тренды стриминга") -> str:
+def build_style_report_html(videos: list, title: str = "Анализ подачи — твич-стримеры",
+                             analyst_commentary: str = None) -> str:
     now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
 
     if not videos:
@@ -93,6 +92,7 @@ def build_style_report_html(videos: list, title: str = "Анализ подач�
         [v for v in videos if v.is_small_channel_big_views],
         key=lambda v: (v.views_per_subscriber or 0), reverse=True
     )
+    max_velocity = max((v.velocity for v in videos), default=1) or 1
 
     avg_er_hot = (sum(v.engagement_rate for v in hot) / len(hot) * 100) if hot else 0
     avg_er_rising = (sum(v.engagement_rate for v in rising) / len(rising) * 100) if rising else 0
@@ -104,21 +104,19 @@ def build_style_report_html(videos: list, title: str = "Анализ подач�
 
     shorts_pct = (len(shorts) / len(videos) * 100) if videos else 0
 
-    small_rows = "".join(_row_html(i, v) for i, v in enumerate(small[:20]))
+    analyst_html = ""
+    if analyst_commentary:
+        analyst_html = f"""
+<div class="analyst-box">
+  <div class="label">🎙️ Мнение аналитика</div>
+  {_esc(analyst_commentary).replace(chr(10)+chr(10), '<br><br>').replace(chr(10), '<br>')}
+</div>"""
+
     small_section = ""
     if small:
-        small_section = f"""
-<section>
-  <h2>🚀 Маленькие каналы, большие просмотры — референсы для формата</h2>
-  <div class="table-wrap"><table>
-    <thead><tr><th>#</th><th>Видео</th><th>Канал</th><th class="num">Просмотры</th>
-    <th class="num">Подписчики</th><th class="num">Просм./Подп.</th><th class="num">Скорость</th>
-    <th class="num">Вовлечён.</th><th>Заметки по подаче</th></tr></thead>
-    <tbody>{small_rows}</tbody>
-  </table></div>
-</section>"""
+        small_section = _table_section("🚀 Маленькие каналы, большие просмотры — референсы для формата", small[:20], max_velocity)
 
-    detail_rows = "".join(_row_html(i, v) for i, v in enumerate(videos[:60]))
+    detail_section = _table_section(f"Разбор по видео (топ {min(len(videos),60)} по скорости роста)", videos[:60], max_velocity)
 
     return f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8">
@@ -138,7 +136,7 @@ def build_style_report_html(videos: list, title: str = "Анализ подач�
   <div class="stat hot"><b>{avg_er_hot:.1f}%</b>ср. вовлечённость HOT</div>
   <div class="stat rising"><b>{avg_er_rising:.1f}%</b>ср. вовлечённость RISING</div>
 </div>
-
+{analyst_html}
 <div class="callout">
   <b>Как читать:</b> вовлечённость = (лайки + комментарии) / просмотры — чем выше, тем сильнее
   видео цепляет тех, кто его уже посмотрел. Скорость — просмотров в час с публикации, показывает,
@@ -152,18 +150,5 @@ def build_style_report_html(videos: list, title: str = "Анализ подач�
 </section>
 
 {small_section}
-
-<section>
-  <h2>Разбор по видео (топ {min(len(videos),60)} по скорости роста)</h2>
-  <div class="table-wrap">
-    <table>
-      <thead><tr>
-        <th>#</th><th>Видео</th><th>Канал</th><th class="num">Просмотры</th>
-        <th class="num">Подписчики</th><th class="num">Просм./Подп.</th>
-        <th class="num">Скорость</th><th class="num">Вовлечён.</th><th>Заметки по подаче</th>
-      </tr></thead>
-      <tbody>{detail_rows}</tbody>
-    </table>
-  </div>
-</section>
+{detail_section}
 </body></html>"""

@@ -23,15 +23,28 @@ from typing import Optional
 
 from googleapiclient.discovery import build
 
+import storage
+from streamer_filter import passes_streamer_filter
+
 # Ключевые слова сегмента — под "русскоязычный стриминг + медиа-личности".
 # Дополняй именами конкретных стримеров/блогеров, за которыми следишь —
 # так выдача станет точнее под твою тему.
+# Ключевые слова сегмента — строго "русскоязычный твич-стриминг".
+# Дополняй именами конкретных стримеров, за которыми следишь — так выдача станет точнее.
 DEFAULT_KEYWORDS = [
-    "стример", "стримеры", "твич стрим", "разборка стримера", "срач стримеров",
-    "скандал стример", "летсплей тренд", "блогер стример", "донат стрим",
-    "стрим драма", "ютубер скандал", "блогер разоблачение", "стример новости",
-    "трэш стрим", "ссора блогеров", "реакция на стрим", "звездная болезнь блогер",
-    "стрим ситуация", "медиа персона разбор", "блогер извинения",
+    "твич стример", "твич стримеры", "twitch стрим", "разборка стримера",
+    "срач стримеров", "скандал стримера", "блогер стример", "донат стрим",
+    "стрим драма", "стример новости", "трэш стрим", "ссора стримеров",
+    "реакция на стрим", "звездная болезнь стример", "стрим ситуация",
+    "стример извинения", "лучшие моменты со стрима стримера",
+    "стример собрал донаты", "новый стример", "стример вырос",
+]
+
+# Урезанный набор для частых автоматических "пульс"-проверок (каждый 1-2ч) —
+# полный DEFAULT_KEYWORDS столько раз в день не потянет бесплатная квота API.
+PULSE_KEYWORDS = [
+    "твич стример", "скандал стримера", "срач стримеров", "стрим драма",
+    "стример новости", "трэш стрим",
 ]
 
 LOOKBACK_HOURS = 72                # глубина поиска по времени публикации
@@ -69,10 +82,39 @@ class TrendVideo:
     duration_seconds: int
     tags: list = field(default_factory=list)
     subscriber_count: Optional[int] = None
+    topic_categories: list = field(default_factory=list)
+    thumbnail_url: str = ""
+    category_id: str = ""
+    # метаданные канала — вытягиваем всё, что реально доступно через API
+    channel_avatar_url: str = ""
+    channel_view_count: Optional[int] = None
+    channel_video_count: Optional[int] = None
+    channel_created_at: Optional[datetime.datetime] = None
+    channel_country: str = ""
+    channel_description: str = ""
 
     @property
     def url(self) -> str:
         return f"https://www.youtube.com/watch?v={self.video_id}"
+
+    @property
+    def channel_url(self) -> str:
+        return f"https://www.youtube.com/channel/{self.channel_id}"
+
+    @property
+    def channel_age_days(self) -> Optional[int]:
+        if not self.channel_created_at:
+            return None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - self.channel_created_at).days
+
+    @property
+    def channel_avg_views_per_video(self) -> Optional[float]:
+        if not self.channel_view_count or not self.channel_video_count:
+            return None
+        if self.channel_video_count == 0:
+            return None
+        return self.channel_view_count / self.channel_video_count
 
     @property
     def bucket(self) -> str:
@@ -250,29 +292,59 @@ def fetch_trends(api_key: str, keywords=None, lookback_hours: int = LOOKBACK_HOU
                 keyword=keyword_by_id.get(item["id"], ""),
                 duration_seconds=duration_seconds,
                 tags=snippet.get("tags", []) or [],
+                thumbnail_url=(
+                    snippet.get("thumbnails", {}).get("medium", {}).get("url")
+                    or snippet.get("thumbnails", {}).get("default", {}).get("url", "")
+                ),
+                category_id=snippet.get("categoryId", ""),
             )
             prelim.append(tv)
             videos_by_channel.setdefault(channel_id, []).append(tv)
 
-    # Подтягиваем число подписчиков пачками по 50 каналов
+    # Подтягиваем полную статистику канала: подписчики, общие просмотры, число видео,
+    # дату создания, страну, аватар, описание, topic-категории — всё, что доступно через API
     channel_ids = list(videos_by_channel.keys())
     for chunk in _chunks(channel_ids, 50):
         ch_resp = youtube.channels().list(
-            part="statistics",
+            part="statistics,topicDetails,snippet",
             id=",".join(chunk),
         ).execute()
         for item in ch_resp.get("items", []):
             cid = item["id"]
             stats = item.get("statistics", {})
+            ch_snippet = item.get("snippet", {})
+
             if stats.get("hiddenSubscriberCount"):
                 sub_count = None
             else:
                 sub_count = int(stats["subscriberCount"]) if "subscriberCount" in stats else None
+            channel_views = int(stats["viewCount"]) if "viewCount" in stats else None
+            channel_videos = int(stats["videoCount"]) if "videoCount" in stats else None
+            topics = item.get("topicDetails", {}).get("topicCategories", [])
+            avatar = ch_snippet.get("thumbnails", {}).get("default", {}).get("url", "")
+            created_at = _parse_dt(ch_snippet["publishedAt"]) if "publishedAt" in ch_snippet else None
+            country = ch_snippet.get("country", "")
+            description = (ch_snippet.get("description") or "")[:300]
+
             for tv in videos_by_channel.get(cid, []):
                 tv.subscriber_count = sub_count
+                tv.topic_categories = topics
+                tv.channel_view_count = channel_views
+                tv.channel_video_count = channel_videos
+                tv.channel_created_at = created_at
+                tv.channel_country = country
+                tv.channel_avatar_url = avatar
+                tv.channel_description = description
 
-    prelim.sort(key=lambda v: v.velocity, reverse=True)
-    return prelim
+    # Жёсткий фильтр: только твич-стримеры, без бойцов/единоборств и без нарезок
+    filtered = [v for v in prelim if passes_streamer_filter(v)]
+
+    # Пишем снепшоты подписчиков для трекинга роста каналов со временем
+    for v in filtered:
+        storage.record_snapshot(v.channel_id, v.channel, v.subscriber_count)
+
+    filtered.sort(key=lambda v: v.velocity, reverse=True)
+    return filtered
 
 
 def format_trends_message(videos: list, limit: int = 12) -> str:
